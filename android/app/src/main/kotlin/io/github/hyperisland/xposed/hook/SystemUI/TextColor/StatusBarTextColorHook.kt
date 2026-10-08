@@ -6,8 +6,10 @@ import android.graphics.Rect
 import android.os.Handler
 import android.os.Looper
 import android.view.Choreographer
+import android.view.View
 import android.widget.TextView
 import io.github.hyperisland.xposed.utils.HookUtils
+import io.github.hyperisland.xposed.hook.SystemUI.DynamicIslandVisibilityHook
 import io.github.libxposed.api.XposedModule
 import io.github.libxposed.api.XposedModuleInterface.PackageLoadedParam
 import java.lang.ref.WeakReference
@@ -44,6 +46,10 @@ object StatusBarTextColorHook : BaseHook() {
     private val dispatcherFields = Collections.synchronizedMap(
         WeakHashMap<Class<*>, DispatcherFields>()
     )
+    private val hookedClockClasses = Collections.synchronizedSet(
+        Collections.newSetFromMap(WeakHashMap<Class<*>, Boolean>())
+    )
+    private val padClockVisibility = Collections.synchronizedMap(WeakHashMap<TextView, Int>())
 
     @Volatile private var activeDispatcher = WeakReference<Any>(null)
     @Volatile private var activeReceiverRegistered = false
@@ -58,6 +64,15 @@ object StatusBarTextColorHook : BaseHook() {
     @Volatile private var lightColor = Color.WHITE
     @Volatile private var darkColor = Color.BLACK
     @Volatile private var useTint = true
+    @Volatile private var islandRegionVisible = false
+
+    private val islandVisibilityListener: (DynamicIslandVisibilityHook.Event) -> Unit = { event ->
+        if (event.global) {
+            islandRegionVisible = event.visible
+            val clocks = synchronized(padClockVisibility) { padClockVisibility.keys.toList() }
+            clocks.forEach(::updatePadClockVisibility)
+        }
+    }
 
     private val tintFrameCallback = Choreographer.FrameCallback {
         frameScheduled.set(false)
@@ -79,6 +94,7 @@ object StatusBarTextColorHook : BaseHook() {
 
     override fun onInit(module: XposedModule, param: PackageLoadedParam) {
         IslandUiStateSource.addStateListener(::onIslandUiStateChanged)
+        DynamicIslandVisibilityHook.addListener(islandVisibilityListener)
         hookClasses(module, param.defaultClassLoader)
         HookUtils.hookDynamicClassLoaders(module, ClassLoader.getSystemClassLoader()) { classLoader ->
             hookClasses(module, classLoader)
@@ -103,8 +119,52 @@ object StatusBarTextColorHook : BaseHook() {
 
     private fun hookClasses(module: XposedModule, classLoader: ClassLoader) {
         IslandUiStateSource.hookClasses(module, classLoader)
+        hookPadClockVisibility(module, classLoader)
         if (!hookDarkIconDispatcher(module, classLoader)) {
             hookLegacyClockFallback(module, classLoader)
+        }
+    }
+
+    /** Keep Pad's combined time/date TextView in step with the status-bar island hide region. */
+    private fun hookPadClockVisibility(module: XposedModule, classLoader: ClassLoader) {
+        runCatching {
+            val clockClass = classLoader.loadClass("com.android.systemui.statusbar.views.MiuiClock")
+            if (!hookedClockClasses.add(clockClass)) return
+            clockClass.declaredConstructors.forEach { constructor ->
+                constructor.isAccessible = true
+                module.hook(constructor).intercept { chain ->
+                    val result = chain.proceed()
+                    val clock = chain.thisObject as? TextView
+                    if (clock != null && isPadClock(clock)) {
+                        padClockVisibility.putIfAbsent(clock, clock.visibility)
+                        updatePadClockVisibility(clock)
+                    }
+                    result
+                }
+            }
+            log(module) { "hooked Pad date clock visibility" }
+        }.onFailure { error ->
+            if (error !is ClassNotFoundException) {
+                logFailureOnce(module, "pad-clock:${System.identityHashCode(classLoader)}") {
+                    "failed to hook Pad date clock visibility: ${error.message}"
+                }
+            }
+        }
+    }
+
+    private fun isPadClock(clock: TextView): Boolean = runCatching {
+        clock.resources.getResourceEntryName(clock.id) == "pad_clock"
+    }.getOrDefault(false)
+
+    private fun updatePadClockVisibility(clock: TextView) {
+        val original = padClockVisibility[clock] ?: return
+        clock.post {
+            if (islandRegionVisible) {
+                clock.visibility = View.GONE
+            } else {
+                clock.visibility = original
+                padClockVisibility.remove(clock)
+            }
         }
     }
 
